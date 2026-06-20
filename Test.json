@@ -1,0 +1,256 @@
+(function() {
+  'use strict';
+
+  let enabled = false;
+  let currentTarget = null;
+  let aimActive = false;
+  let aimStage = 0;
+  let lockTimer = null;
+  let aimLoop = null;
+  let fireButtonDown = false;
+  let baseAddress = null;
+
+  const PATTERN = [
+    0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xA5, 0x43
+  ];
+
+  const OFFSETS = {
+    cameraX: 0x10,
+    cameraY: 0x14,
+    cameraZ: 0x18,
+    cameraYaw: 0x1C,
+    cameraPitch: 0x20,
+    neckY: 0xB6,
+    neckX: 0xB2,
+    headValue: 0x3B4
+  };
+
+  const CONFIG = {
+    neckOffset: 62,
+    headOffset: 84,
+    stage1To2Time: 100,
+    stage2To3Time: 150,
+    speedStage1: 0.50,
+    speedStage2: 0.20,
+    speedStage3: 0.04,
+    lockAngle: 1.2,
+    fov: 360,
+    maxDistance: 8000,
+    prediction: 0.08
+  };
+
+  function getBase() {
+    return baseAddress;
+  }
+
+  function setBase(addr) {
+    baseAddress = addr;
+  }
+
+  function getCamPos() {
+    return window.playerCameraPosition || window.cameraPosition || window.localCameraPos || null;
+  }
+
+  function getCamRot() {
+    return window.playerCameraRotation || window.cameraRotation || window.localCameraRot || null;
+  }
+
+  function setCamRot(yaw, pitch) {
+    if (window.playerCameraRotation) {
+      window.playerCameraRotation.yaw = yaw;
+      window.playerCameraRotation.pitch = pitch;
+    }
+    if (window.cameraRotation) {
+      window.cameraRotation.yaw = yaw;
+      window.cameraRotation.pitch = pitch;
+    }
+    if (window.localCameraRot) {
+      window.localCameraRot.yaw = yaw;
+      window.localCameraRot.pitch = pitch;
+    }
+  }
+
+  function getEnemies() {
+    return window.enemyList || window.playerList || window.players || window.targets || [];
+  }
+
+  function getMyTeam() {
+    return window.playerTeamId || window.localTeamId || window.teamId || -999;
+  }
+
+  function isAlive(e) {
+    if (e.alive !== undefined) return e.alive;
+    if (e.hp !== undefined) return e.hp > 0;
+    if (e.health !== undefined) return e.health > 0;
+    return true;
+  }
+
+  function getPos(e) {
+    return e.position || e.pos || e.worldPosition || null;
+  }
+
+  function getVel(e) {
+    return e.velocity || e.vel || { x: 0, y: 0, z: 0 };
+  }
+
+  function findTarget() {
+    const camPos = getCamPos();
+    const camRot = getCamRot();
+    const enemies = getEnemies();
+    const myTeam = getMyTeam();
+    if (!camPos || !camRot || !enemies.length) return null;
+
+    let best = null;
+    let bestScore = Infinity;
+
+    for (const e of enemies) {
+      if (e.teamId === myTeam || !isAlive(e)) continue;
+      const pos = getPos(e);
+      if (!pos) continue;
+      const vel = getVel(e);
+
+      const px = pos.x + vel.x * CONFIG.prediction;
+      const py = pos.y + vel.y * CONFIG.prediction;
+      const pz = pos.z + vel.z * CONFIG.prediction;
+
+      const dx = px - camPos.x;
+      const dy = py - camPos.y;
+      const dz = pz - camPos.z;
+      const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+      if (dist > CONFIG.maxDistance) continue;
+
+      const ty = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
+      const hd = Math.sqrt(dx*dx + dy*dy);
+      const tp = -Math.atan2(dz, hd) * 180 / Math.PI;
+
+      const cy = (camRot.yaw + 360) % 360;
+      let yd = Math.abs(ty - cy);
+      if (yd > 180) yd = 360 - yd;
+      const pd = Math.abs(tp - camRot.pitch);
+      const ang = Math.sqrt(yd*yd + pd*pd);
+      if (ang > CONFIG.fov / 2) continue;
+
+      const score = ang + dist * 0.0001;
+      if (score < bestScore) {
+        bestScore = score;
+        best = { x: px, y: py, z: pz, dx, dy, dz, dist, ang };
+      }
+    }
+    return best;
+  }
+
+  function calcAngles(target, stage) {
+    const camPos = getCamPos();
+    if (!camPos) return null;
+    const offZ = stage === 1 ? CONFIG.neckOffset : CONFIG.headOffset;
+    const dx = target.x - camPos.x;
+    const dy = target.y - camPos.y;
+    const dz = (target.z + offZ) - camPos.z;
+    const yaw = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
+    const hd = Math.sqrt(dx*dx + dy*dy);
+    const pitch = Math.max(-89, Math.min(89, -Math.atan2(dz, hd) * 180 / Math.PI));
+    return { yaw, pitch };
+  }
+
+  function getSpeed() {
+    if (aimStage === 1) return CONFIG.speedStage1;
+    if (aimStage === 2) return CONFIG.speedStage2;
+    return CONFIG.speedStage3;
+  }
+
+  function applyAim(angles) {
+    const camRot = getCamRot();
+    if (!camRot) return;
+
+    const spd = getSpeed();
+    const cy = (camRot.yaw + 360) % 360;
+    let yd = angles.yaw - cy;
+    if (yd > 180) yd -= 360;
+    if (yd < -180) yd += 360;
+    const pd = angles.pitch - camRot.pitch;
+
+    let newYaw, newPitch;
+    if (Math.abs(yd) < CONFIG.lockAngle && Math.abs(pd) < CONFIG.lockAngle && aimStage >= 3) {
+      newYaw = angles.yaw;
+      newPitch = angles.pitch;
+    } else {
+      newYaw = camRot.yaw + yd * spd;
+      newPitch = camRot.pitch + pd * spd;
+    }
+
+    newYaw = (newYaw + 360) % 360;
+    newPitch = Math.max(-89, Math.min(89, newPitch));
+
+    setCamRot(newYaw, newPitch);
+  }
+
+  function advanceStage() {
+    if (!aimActive || !fireButtonDown) return;
+    if (aimStage < 3) {
+      aimStage++;
+      const dur = aimStage === 2 ? CONFIG.stage1To2Time : CONFIG.stage2To3Time;
+      if (lockTimer) clearTimeout(lockTimer);
+      lockTimer = setTimeout(() => advanceStage(), dur);
+    }
+  }
+
+  function step() {
+    if (!aimActive || !fireButtonDown || !currentTarget) { stopLoop(); return; }
+    const newTarget = findTarget();
+    if (newTarget) currentTarget = newTarget;
+    const angles = calcAngles(currentTarget, aimStage);
+    if (angles) applyAim(angles);
+  }
+
+  function startLoop() {
+    stopLoop();
+    aimLoop = setInterval(step, 16);
+  }
+
+  function stopLoop() {
+    if (aimLoop) { clearInterval(aimLoop); aimLoop = null; }
+    if (lockTimer) { clearTimeout(lockTimer); lockTimer = null; }
+  }
+
+  function onFireDown(e) {
+    if (!enabled) return;
+    e.preventDefault();
+    fireButtonDown = true;
+    const target = findTarget();
+    if (!target) return;
+    currentTarget = target;
+    aimActive = true;
+    aimStage = 1;
+    startLoop();
+    if (lockTimer) clearTimeout(lockTimer);
+    lockTimer = setTimeout(() => advanceStage(), CONFIG.stage1To2Time);
+  }
+
+  function onFireUp(e) {
+    e.preventDefault();
+    fireButtonDown = false;
+    aimActive = false;
+    currentTarget = null;
+    aimStage = 0;
+    stopLoop();
+  }
+
+  document.addEventListener('touchstart', onFireDown, { passive: false });
+  document.addEventListener('touchend', onFireUp, { passive: false });
+  document.addEventListener('touchcancel', onFireUp, { passive: false });
+
+  window.AimNeckToHead = {
+    enable: () => { enabled = true; },
+    disable: () => { enabled = false; onFireUp({ preventDefault: () => {} }); },
+    setConfig: (cfg) => Object.assign(CONFIG, cfg),
+    getConfig: () => ({ ...CONFIG }),
+    setBaseAddress: (addr) => setBase(addr),
+    getBaseAddress: () => getBase()
+  };
+})();
